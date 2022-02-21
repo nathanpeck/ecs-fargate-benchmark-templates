@@ -1,0 +1,181 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: An EC2 service, with AWS VPC networking mode, and no LB
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: benchmark
+    Description: The name of the environment to add this service to
+  ServiceName:
+    Type: String
+    Default: benchmark-ec2-no-lb-host
+    Description: A name for the service
+  ImageUrl:
+    Type: String
+    Default: public.ecr.aws/docker/library/busybox:latest
+    Description: The url of a docker image that contains the application process that
+                 will handle the traffic for this service
+  ContainerCpu:
+    Type: Number
+    Default: 256
+    Description: How much CPU to give the container. 1024 is 1 CPU
+  ContainerMemory:
+    Type: Number
+    Default: 512
+    Description: How much memory in megabytes to give the container
+  Command:
+    Type: String
+    Default: sleep 3600
+    Description: The command to run inside of the container
+  DesiredCount:
+    Type: Number
+    Default: 0
+    Description: How many copies of the service task to run
+  Role:
+    Type: String
+    Default: ""
+    Description: (Optional) An IAM role to give the service's containers if the code within needs to
+                 access other AWS resources like S3 buckets, DynamoDB tables, etc
+
+Conditions:
+  HasCustomRole: !Not [ !Equals [!Ref 'Role', ''] ]
+
+Resources:
+  # A log group for storing the stdout logs from this service's containers
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub ${EnvironmentName}-service-${ServiceName}
+
+  # The task definition. This is a simple metadata description of what
+  # container to run, and what resource requirements it has.
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref 'ServiceName'
+      Cpu: !Ref 'ContainerCpu'
+      Memory: !Ref 'ContainerMemory'
+      NetworkMode: host
+      RequiresCompatibilities:
+        - EC2
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub ${EnvironmentName}:ECSTaskExecutionRole
+      TaskRoleArn:
+        Fn::If:
+          - 'HasCustomRole'
+          - !Ref 'Role'
+          - !Ref "AWS::NoValue"
+      ContainerDefinitions:
+        - Name: !Ref 'ServiceName'
+          Cpu: !Ref 'ContainerCpu'
+          Memory: !Ref 'ContainerMemory'
+          Image: !Ref 'ImageUrl'
+          Command: !Split [' ', !Ref 'Command']
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              awslogs-group: !Sub ${EnvironmentName}-service-${ServiceName}
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: !Ref 'ServiceName'
+
+  # The service. The service is a resource which allows you to run multiple
+  # copies of a type of task, and gather up their logs and metrics, as well
+  # as monitor the number of running tasks and replace any that have crashed
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Ref 'ServiceName'
+      Cluster:
+        Fn::ImportValue: !Sub ${EnvironmentName}:ClusterName
+      PlacementStrategies:
+        - Field: attribute:ecs.availability-zone
+          Type: spread
+        - Field: cpu
+          Type: binpack
+      CapacityProviderStrategy:
+        - Base: 0
+          CapacityProvider:
+            Fn::ImportValue: !Sub ${EnvironmentName}:CapacityProvider
+          Weight: 1
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 75
+      DesiredCount: !Ref 'DesiredCount'
+      TaskDefinition: !Ref 'TaskDefinition'
+
+  # A CloudWatch log group for persisting the deployment events
+  ServiceEventLog:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/events/${EnvironmentName}-${ServiceName}-events
+
+  # Create the EventBridge rule that captures deployment events into the CloudWatch log group
+  CaptureServiceDeploymentEvents:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub 'Capture service deployment events from the ECS service ${ServiceName}'
+      # Which events to capture
+      EventPattern:
+        source:
+          - aws.ecs
+        detail-type:
+          - "ECS Deployment State Change"
+          - "ECS Service Action"
+        resources:
+          - !Ref Service
+      # Where to send the events
+      Targets:
+        - Arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ServiceEventLog}
+          Id: 'CloudWatchLogGroup'
+
+  # A CloudWatch dashboard that runs a CloudWatch Log Insights query to display the deployment events
+  # from ECS
+  ServiceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${ServiceName}-Deployments
+      DashboardBody:
+        !Sub
+          - |
+            {
+              "widgets": [
+                {
+                  "type": "log",
+                  "x": 0,
+                  "y": 0,
+                  "width": 24,
+                  "height": 12,
+                  "properties": {
+                    "region": "${AWS::Region}",
+                    "title": "Service Deployments",
+                    "query": "SOURCE '${ServiceEventLog}' | fields @timestamp, detail.eventName, detail.deploymentId | sort @timestamp desc | limit 500",
+                    "view": "table"
+                  }
+                },
+                {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 13,
+                  "width": 24,
+                  "height": 6,
+                  "properties": {
+                      "metrics": [
+                          [ "ECS/ContainerInsights", "RunningTaskCount", "ServiceName", "${Service.Name}", "ClusterName", "${ClusterName}" ],
+                          [ ".", "DesiredTaskCount", ".", ".", ".", "." ]
+                      ],
+                      "view": "timeSeries",
+                      "stacked": false,
+                      "region": "${AWS::Region}",
+                      "stat": "Sum",
+                      "period": 60,
+                      "yAxis": {
+                          "left": {
+                              "min": 0
+                          }
+                      },
+                      "title": "DesiredTaskCount, RunningTaskCount"
+                  }
+                }
+              ]
+            }
+          - ClusterName: !ImportValue
+              'Fn::Sub': ${EnvironmentName}:ClusterName
